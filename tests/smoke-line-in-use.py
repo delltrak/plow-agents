@@ -12,9 +12,9 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import runpy
 import socket
-import os
 import subprocess
 import sys
 import tempfile
@@ -273,8 +273,7 @@ def main() -> int:
         Stub.requests.clear()
         occupied = run("mint", CLOUD, cwd=work, base=base, token=token)
         check("occupied line is refused without a file", occupied.returncode != 0 and not os.path.exists(credential), True)
-        check("cloud-held line names its agent and sends them to Plow", "agt_cloud" in occupied.stderr and "delete it in Plow" in occupied.stderr, True)
-        check("cloud-held line does not suggest revoke, which refuses it", "revoke" in occupied.stderr, False)
+        check("cloud-held line names its agent and suggests revoke", "agt_cloud" in occupied.stderr and f"revoke {CLOUD}" in occupied.stderr, True)
         held = run("mint", SELF_HOSTED, cwd=work, base=base, token=token)
         check("self-hosted holder is pointed at revoke", held.returncode != 0 and "agt_self_hosted" in held.stderr and f"revoke {SELF_HOSTED}" in held.stderr, True)
         # The refusal is this tool's, not the server's: nothing is created and
@@ -324,8 +323,27 @@ def main() -> int:
             check("rotation preserves identity", "# plow-agent-uid: d2e048a4cbefdc491657eaddc9c7657a\n" in updated, True)
             check("rotation never prints token", "plow_rotated100_token" in rotated.stdout + rotated.stderr, False)
             check("rotation keeps mode 600", os.stat(credential).st_mode & 0o777, 0o600)
+            with open(credential, "w") as handle:
+                handle.write("# plow-agent-uid: agt_cloud\n")
+            Stub.requests.clear()
+            cloud_file = run("revoke", cwd=work, base=base, token=token)
+            check("credential-file revoke still refuses cloud agents", cloud_file.returncode != 0 and not any(req.startswith("DELETE ") for req in Stub.requests), True)
+            with open(credential, "w") as handle:
+                handle.write(updated)
+            Stub.delete_status = 500
+            failed_cloud = run("revoke", CLOUD, cwd=work, base=base, token=token)
+            check("line revoke HTTP 500 gives incomplete-retirement recovery", failed_cloud.returncode != 0 and "retirement may be incomplete" in failed_cloud.stderr and f"re-run `plow-agents revoke {CLOUD}`" in failed_cloud.stderr, True)
+            check("line revoke HTTP 500 does not report success", "Retired agent" in failed_cloud.stderr, False)
+            with open(credential) as handle:
+                check("line revoke HTTP 500 preserves credential", handle.read(), updated)
+            Stub.delete_status = 200
             cloud = run("revoke", CLOUD, cwd=work, base=base, token=token)
-            check("line recovery refuses cloud agents", cloud.returncode != 0 and "delete that agent in Plow" in cloud.stderr, True)
+            check("line revoke retires cloud agent", cloud.returncode == 0 and "agt_cloud" in Stub.revoked and "agt_cloud" not in AGENTS, True)
+            check("line revoke prints retired cloud agent and line", f"Retired agent agt_cloud (exe:life) on line:{CLOUD}." in cloud.stderr, True)
+            check("line revoke explains conditional chat retirement", f"If this agent had authenticated, your chats on line:{CLOUD} were retired too." in cloud.stderr, True)
+            check("retired cloud line is free", next(row for row in Stub.lines["data"] if row["uid"] == CLOUD)["agent_uid"], None)
+            with open(credential) as handle:
+                check("cloud revoke preserves unrelated credential", handle.read(), updated)
             recovered = run("revoke", SELF_HOSTED, cwd=work, base=base, token=token)
             check("line recovery retires its self_hosted agent", recovered.returncode == 0 and "agt_self_hosted" in Stub.revoked, True)
             check("line recovery leaves a different credential", os.path.exists(credential), True)

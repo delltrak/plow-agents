@@ -11,3 +11,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 tests/smoke-line-in-use.py
+      - run: python3 tests/smoke-deploy.py

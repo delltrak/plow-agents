@@ -1,49 +1,102 @@
 # plow-agents
 
-Run a Plow agent in Docker and give it a real Plow line.
+Build an agent image, run it on Plow, and text it from your phone.
 
-Requires Python 3 (standard library only), Git, and Docker Compose. Install the CLI:
+## What you need
+
+Python 3.11 or newer, Git, Docker, a registry account that can publish public images,
+and a phone that can send an activation text. For local runs, use Docker Compose
+2.24 or newer and an agent repository with a Dockerfile and `compose.yml`.
+
+Your agent reads `PLOW_API_BASE` from its environment; if `PLOW_AGENT_TOKEN` is set,
+send it as a bearer. See the [image contract](https://github.com/plow-pbc/plow/blob/main/api/cloud-agents/README.md).
+
+## 1. Install and log in
 
 ```sh
 git clone https://github.com/plow-pbc/plow-agents.git
 export PATH="$PWD/plow-agents/bin:$PATH"
-```
-
-## Quickstart
-
-The sample base ships its own `compose.yml`:
-
-```sh
-git clone https://github.com/plow-pbc/plow-hermes-agent.git
-cd plow-hermes-agent
-```
-
-Log in, then text the printed activation phrase from the phone that owns your account. No phone argument is needed.
-Use `login --new-line` if you need an assistant line. Replace `ln_xxx` with a free line ID.
-
-```sh
-plow-agents login
+plow-agents login --new-line
 plow-agents lines
-plow-agents mint ln_xxx
-docker compose up --build -d
 ```
 
-`mint` writes `./plow-credentials`; run it before `up`. The first build takes a few minutes.
-Watch `docker compose logs -f agent` until `plow-init: configured ... as cht_` appears, then text the selected line to talk to it.
-When finished, retire the agent and remove its local memory:
+Text the activation phrase to the number printed by `login`. Use `plow-agents login`
+if you already have a line. Keep the ID of a `free` line for step 5.
+
+## 2. Write a Dockerfile
+
+Start with a Dockerfile for your agent. For example, if your Python agent starts
+from `agent.py`:
+
+```dockerfile
+FROM python:3.11-slim
+COPY agent.py /agent.py
+CMD ["python", "/agent.py"]
+```
+
+Keep credentials out of Git and image builds:
+
+```sh
+printf '\n/plow-credentials\n' >> .gitignore
+printf '\n/plow-credentials\n' >> .dockerignore
+```
+
+## 3. Build the image
+
+```sh
+plow-agents image build ghcr.io/YOUR_ACCOUNT/my-agent:v1
+```
+
+If ./plow-agents.toml has image = "…", you can omit the name.
+
+## 4. Push the image
+
+Create a [classic GitHub PAT](https://github.com/settings/tokens/new?scopes=write:packages) with `write:packages`; fine-grained PATs cannot push to GHCR. Use the PAT as the password when Docker prompts:
+
+```sh
+docker login ghcr.io -u YOUR_GITHUB_USERNAME
+plow-agents image push ghcr.io/YOUR_ACCOUNT/my-agent:v1
+```
+
+After the first push, make the package public in GitHub package settings; otherwise Plow’s anonymous pull fails.
+Copy the full `repository@sha256:…` reference printed on the last line.
+
+## 5. Request an agent
+
+Replace `ln_xxx` with the free line ID from step 1 and use the reference from step 4:
+
+```sh
+plow-agents deploy ghcr.io/YOUR_ACCOUNT/my-agent@sha256:… --line ln_xxx
+plow-agents agents
+```
+
+You can also deploy a listing with `plow-agents deploy exe:hermes`.
+If your account has exactly one free line, `deploy` selects it.
+
+## 6. Text it
+
+Run `plow-agents agents` until the status is `running`. Text the number shown by
+`plow-agents lines`. A `failed` status includes the failure code beside it.
+
+## 7. Run it locally
+
+Copy [compose.example.yml](compose.example.yml) into your agent repository as
+`compose.yml`, then choose a free line:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/plow-pbc/plow-agents/main/compose.example.yml -o compose.yml
+plow-agents lines
+plow-agents deploy --local --line ln_xxx
+docker compose logs -f
+```
+
+If the container reaches your API at a different address, pass
+`--agent-api-base URL` to `plow-agents deploy --local`. When finished:
 
 ```sh
 plow-agents revoke
 docker compose down -v
 ```
-
-## Build your own agent
-
-Your repository owns `compose.yml`; copy [compose.example.yml](compose.example.yml) beside your Dockerfile.
-Start your Dockerfile with `FROM` the [plow-hermes-agent base image](https://github.com/plow-pbc/plow-hermes-agent).
-Pulling the published base from public.ecr.aws can 403 on stale credentials: `docker logout public.ecr.aws`, then rebuild.
-Add `/plow-credentials` to both `.gitignore` and `.dockerignore`.
-`docker compose down` keeps memory; `docker compose down -v` starts fresh and picks up image changes to `SOUL.md`. Skill updates reach the agent on rebuild alone; a skill the agent has changed, and google-workspace, need `down -v`.
 
 ## Leaderboard
 
@@ -68,28 +121,28 @@ plow-agents profile --name "Ada" --photo https://example.com/ada.jpg
 plow-agents profile --show
 ```
 
-## Reference
+## Commands
 
 | Command | Purpose |
 | --- | --- |
-| `login [--new-line]` | Text a code to log in; optionally create an assistant line. |
-| `lines` | List line IDs, names, numbers, and status; choose a `free` line. |
-| `profile [--name NAME] [--photo PHOTO] [--show]` | Set or show your account profile. |
-| `mint <line>` | Write a credential for a free line to `./plow-credentials`. |
-| `rotate` | Replace the credential; recreate the container to load it. |
-| `revoke [line]` | Retire the agent in the credential file, or the self-hosted agent on a line. |
+| `plow-agents login [--new-line]` | Log in by text; optionally create a line. |
+| `plow-agents lines` | Show line IDs, numbers, and occupancy. |
+| `plow-agents profile [--name NAME] [--photo PHOTO] [--show]` | Set or show your profile; a photo can be a file or HTTPS URL. |
+| `plow-agents mint LINE [--credential-file PATH] [--agent-api-base URL]` | Write a credential for a self-hosted agent. |
+| `plow-agents rotate [--credential-file PATH]` | Replace the credential; recreate the container to load it. |
+| `plow-agents revoke [LINE] [--credential-file PATH]` | Retire any agent on LINE, or the credential-file self-hosted agent. |
+| `plow-agents image build [IMAGE]` | Build the current directory for linux/amd64. |
+| `plow-agents image push [IMAGE]` | Push and print the full image reference. |
+| `plow-agents deploy TARGET [--line LINE]` | Request an image@sha256:… or an `exe:slug` listing. |
+| `plow-agents deploy --local [--line LINE] [--agent-api-base URL]` | Mint a credential and start Compose locally. |
+| `plow-agents agents` | Show tab-separated line, target, and status. |
 
-Prefix commands with `plow-agents`; each accepts `--help`. `mint`, `rotate`, and `revoke` accept `--credential-file <path>`.
-The credential file contains `PLOW_API_BASE`, `PLOW_AGENT_TOKEN`, and a `# plow-agent-uid: <uid>` comment. See [the example](plow-credentials.example).
-
-## Troubleshooting
-
-If `up` ran before `mint`, Docker created a credential directory. Run `docker compose down -v && rmdir plow-credentials`, then mint a line.
+Every command accepts `--help`. Global `--api-base URL` and `--token-file PATH`
+options go before the command.
 
 ## Where changes go
 
-This repo owns the credential CLI and starter Compose file.
-For sibling responsibilities, see [plow-hermes-agent's repo map](https://github.com/plow-pbc/plow-hermes-agent#the-repos).
+Before editing, find the owner in the [sibling repo map](https://github.com/plow-pbc/plow-hermes-agent/blob/main/README.md#the-repos) and make the change there.
 
 ## License
 

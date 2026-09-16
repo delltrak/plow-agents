@@ -8,7 +8,7 @@
     plow-agents mint <line-uid>  that line's credential -> ./plow-credentials
     plow-agents profile          set or show this account's public profile (--photo takes a file)
     plow-agents rotate           replace this self-hosted agent's credential
-    plow-agents revoke [line]    retire a self-hosted agent by file or line
+    plow-agents revoke [line]    retire the credential-file agent, or any agent by line
 
 `login` stores an ACCOUNT token in ~/.config/plow/token; it can list lines, mint,
 rotate, revoke, and read or set the public profile, so it does travel -- over HTTPS, to Plow. What it never does is enter a
@@ -21,10 +21,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import stat
+import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,6 +36,8 @@ from typing import NoReturn
 DEFAULT_API_BASE = "https://api.plow.co"
 CREDENTIAL_FILE = "plow-credentials"
 POLL_S = 3
+CONFIG_FILE = "plow-agents.toml"
+DIGEST = r"sha256:[0-9a-f]{64}"
 # Plow caps a profile photo at 5 MB and takes these four formats. Restated
 # here only to refuse a file before any request is sent; the server decides.
 MAX_PHOTO_BYTES = 5 * 1024 * 1024
@@ -376,19 +381,7 @@ def mint(args: argparse.Namespace) -> None:
     if line is None:
         die(f"unknown line:{line_uid}")
     if line["agent_uid"]:
-        # Which agent decides what the person can do about it: `revoke` retires
-        # a self-hosted one and refuses every other kind, so pointing a cloud
-        # agent's owner at it would only cost them a second refusal. The lines
-        # endpoint publishes no provider, so ask -- on this path only, where a
-        # request is already being spent to say no.
-        status, holder = request("GET", args.api_base + f"/v1/agents/{urllib.parse.quote(line['agent_uid'], safe='')}", token=account)
-        provider = holder.get("provider") if status // 100 == 2 and isinstance(holder, dict) else None
-        remedy = (
-            f"retire it with `plow-agents revoke {line_uid}`" if provider == "self_hosted"
-            else "delete it in Plow (it is a cloud agent)" if provider
-            else "retire that agent before minting here"
-        )
-        die(f"line:{line_uid} already answers as agent {line['agent_uid']} -- {remedy}")
+        die(f"line:{line_uid} already answers as agent {line['agent_uid']} -- retire it with `plow-agents revoke {line_uid}`")
     minted = call("POST", args.api_base, "/v1/agents", token=account,
                   body={"name": "plow-agent", "provider": "self_hosted", "line_uid": line_uid})
     agent, token = minted["agent"], minted["token"]
@@ -419,7 +412,7 @@ def rotate(args: argparse.Namespace) -> None:
 
 
 def revoke(args: argparse.Namespace) -> None:
-    """Retire this file's agent, or recover a self-hosted agent by line."""
+    """Retire this file's self-hosted agent, or any agent on a line."""
     path = os.path.abspath(args.credential_file)
     credential = read_credential(path)
     account = account_token(args)
@@ -434,12 +427,16 @@ def revoke(args: argparse.Namespace) -> None:
     else:
         uid = credential_agent_uid(credential)
     agent = call("GET", args.api_base, f"/v1/agents/{urllib.parse.quote(uid, safe='')}", token=account)
-    if agent["provider"] != "self_hosted":
+    if not args.line and agent["provider"] != "self_hosted":
         die(f"{uid} is not self-hosted -- delete that agent in Plow")
     status, _ = request("DELETE", args.api_base + f"/v1/agents/{urllib.parse.quote(uid, safe='')}", token=account)
+    if args.line and status // 100 == 5:
+        die(f"agent {uid}: HTTP {status}; retirement may be incomplete -- re-run `plow-agents revoke {args.line}`")
     if status // 100 != 2 and status != 404:
         die(f"could not retire agent {uid}: HTTP {status}")
-    log(f"Retired agent {uid}.")
+    log(f"Retired agent {uid} ({agent['provider']}) on line:{args.line}." if args.line else f"Retired agent {uid}.")
+    if args.line and status // 100 == 2:
+        log(f"If this agent had authenticated, your chats on line:{args.line} were retired too.")
     if credential.get("agent_uid") != uid:
         if os.path.exists(path):
             log(f"Left {path} in place: it does not name agent {uid}. Remove it manually only after confirming its ownership.")
@@ -452,6 +449,187 @@ def revoke(args: argparse.Namespace) -> None:
         log(f"{path} could not be removed ({error}). It names a retired agent; delete it yourself.")
         raise SystemExit(2)
     log(f"Removed {path}.")
+
+
+def project() -> dict[str, str]:
+    try:
+        with open(CONFIG_FILE, "rb") as handle:
+            settings = tomllib.load(handle)
+    except FileNotFoundError:
+        return {}
+    except tomllib.TOMLDecodeError as error:
+        die(f"{CONFIG_FILE}: {error}")
+    if any(key != "image" or not isinstance(value, str) for key, value in settings.items()):
+        die(f"{CONFIG_FILE} accepts only an image string")
+    return settings
+
+
+def project_image(image: str | None) -> str:
+    if image is None:
+        image = project().get("image", "")
+    if not image:
+        die(f"pass IMAGE or set image in ./{CONFIG_FILE}")
+    if image.startswith("-") or "@" in image or "/" not in image or any(c.isspace() for c in image):
+        die("image must be a registry/repository:tag")
+    host = image.split("/", 1)[0]
+    if "." not in host.split(":", 1)[0]:
+        die("image needs an explicit registry host, such as docker.io or ghcr.io")
+    return image
+
+
+def image_repository(image: str) -> str:
+    host, name = image.split("/", 1)
+    return f"{host}/{name.rsplit(':', 1)[0]}"
+
+
+def dockerignore_patterns(path: str) -> list[tuple[re.Pattern[str], bool]]:
+    try:
+        with open(path, encoding="utf-8-sig") as handle:
+            lines = handle.readlines()
+    except FileNotFoundError:
+        return []
+    patterns = []
+    for line in lines:
+        if line.startswith("#") or not line.strip():
+            continue
+        pattern = line.strip()
+        exclude = not pattern.startswith("!")
+        pattern = os.path.normpath(pattern if exclude else pattern[1:].strip()).strip("/")
+        if pattern == ".":
+            continue
+        # Docker globs are rooted, match parent directories, and apply in order.
+        tokens = re.findall(r"\\.|\*\*/?|\[(?:\\.|[^\\\]])*\]|.", pattern)
+        expression = ""
+        for index, token in enumerate(tokens):
+            if token.startswith("**"):
+                expression += ".*" if index == len(tokens) - 1 else "(?:.*/)?"
+            elif token == "*":
+                expression += "[^/]*"
+            elif token == "?":
+                expression += "[^/]"
+            elif token.startswith("["):
+                expression += "(?!/)" + token
+            else:
+                expression += re.escape(token[1:] if token.startswith("\\") else token)
+        patterns.append((re.compile(expression + r"(?:/.*)?\Z", re.DOTALL), exclude))
+    return patterns
+
+
+def refuse_credentials(args: argparse.Namespace, ignore_file: str) -> None:
+    account_file = os.path.realpath(token_path(args.token_file))
+    patterns = dockerignore_patterns(ignore_file)
+    def failed(error: OSError) -> NoReturn:
+        die(f"cannot check build context for credentials: {error}")
+    for directory, _, files in os.walk(".", onerror=failed):
+        for filename in files:
+            path = os.path.join(directory, filename)
+            relative = os.path.relpath(path)
+            excluded = False
+            for pattern, exclude in patterns:
+                if pattern.match(relative):
+                    excluded = exclude
+            # Docker always reads the build Dockerfile, even when ignored.
+            if excluded and relative != "Dockerfile":
+                continue
+            if os.path.realpath(path) == account_file:
+                die(f"add {relative} to {ignore_file} before building")
+            try:
+                with open(path, "rb") as handle:
+                    if any(b"PLOW_AGENT_TOKEN=" in line or line.lstrip().startswith(b"# plow-agent-uid:") for line in handle):
+                        if relative == "Dockerfile":
+                            die("remove credentials from Dockerfile before building")
+                        die(f"add {relative} to {ignore_file} before building")
+            except OSError as error:
+                failed(error)
+
+
+def docker(*arguments: str) -> str:
+    command = ["docker", *arguments]
+    log("$ " + " ".join(command))
+    try:
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+    except OSError as error:
+        die(f"cannot run docker: {error}")
+    log(result.stdout.rstrip())
+    if result.stderr:
+        log(result.stderr.rstrip())
+    if result.returncode:
+        die(f"docker {' '.join(arguments)} failed ({result.returncode})")
+    return result.stdout
+
+
+def image_build(args: argparse.Namespace) -> None:
+    image = project_image(args.image)
+    refuse_credentials(args, "Dockerfile.dockerignore" if os.path.exists("Dockerfile.dockerignore") else ".dockerignore")
+    docker("build", "--platform", "linux/amd64", "--tag", image, ".")
+
+
+def image_push(args: argparse.Namespace) -> None:
+    image = project_image(args.image)
+    found = re.findall(r"digest: (" + DIGEST + r")\b", docker("push", image))
+    if not found:
+        die("docker push printed no sha256 digest")
+    print(f"{image_repository(image)}@{found[-1]}")
+
+
+def deploy(args: argparse.Namespace) -> None:
+    if args.local:
+        if args.target:
+            die("--local takes no target; it starts this checkout's Compose project")
+        ignore_file = "Dockerfile.dockerignore" if os.path.exists("Dockerfile.dockerignore") else ".dockerignore"
+        excluded = False
+        for pattern, exclude in dockerignore_patterns(ignore_file):
+            if pattern.match(CREDENTIAL_FILE):
+                excluded = exclude
+        if not excluded:
+            die(f"add {CREDENTIAL_FILE} to {ignore_file} before building")
+    else:
+        if args.agent_api_base is not None:
+            die("deploy --agent-api-base requires --local")
+        target = args.target or ""
+        if target.startswith("exe:"):
+            if not re.fullmatch(r"exe:[a-z0-9][a-z0-9_-]*", target):
+                die("expected exe:<slug>")
+            provider, name = target, target[4:]
+        else:
+            repository, separator, digest = target.partition("@")
+            if not separator or not re.fullmatch(DIGEST, digest):
+                die("deploy needs image@sha256:<64 hex>, exe:<slug>, or --local")
+            repository = project_image(repository)
+            provider = f"exe:{repository}@{digest}"
+            name = image_repository(repository).rsplit("/", 1)[-1]
+    token = account_token(args)
+    if not args.line:
+        free = [row["uid"] for row in account_lines(args.api_base, token) if not row["agent_uid"]]
+        if len(free) != 1:
+            die("pass --line with a free line from `plow-agents lines` (or login --new-line to get one)")
+        args.line = free[0]
+    if args.local:
+        args.credential_file = CREDENTIAL_FILE
+        mint(args)
+        try:
+            docker("compose", "up", "--build", "-d")
+        except (SystemExit, KeyboardInterrupt):
+            log("Compose up did not complete. Agent and plow-credentials kept. "
+                "Fix Compose and run `docker compose up --build -d`, "
+                "or run `plow-agents revoke` to retire the agent.")
+            raise
+        log("Requested local agent. Run `docker compose logs -f` to watch startup.")
+    else:
+        created = call("POST", args.api_base, "/v1/agents", token=token,
+                       body={"name": name, "line_uid": args.line, "provider": provider})
+        log(f"Requested agent {created['agent']['uid']} on line:{args.line}. Run `plow-agents agents` for status.")
+
+
+def agents(args: argparse.Namespace) -> None:
+    deployed = call("GET", args.api_base, "/v1/agents", token=account_token(args))
+    print("LINE\tTARGET\tSTATUS")
+    for agent in deployed:
+        status = agent.get("status") or "-"
+        if agent.get("failure_code"):
+            status += f"({agent['failure_code']})"
+        target = agent["provider"].removeprefix("exe:")
+        print(f"{(agent.get('line') or {}).get('uid') or '-'}\t{target}\t{status}")
 
 
 def main() -> int:
@@ -482,10 +660,25 @@ def main() -> int:
     it.add_argument("--credential-file", default=CREDENTIAL_FILE, help=f"the credential to rotate (default ./{CREDENTIAL_FILE})")
     it.set_defaults(run=rotate)
 
-    it = verbs.add_parser("revoke", help="retire the self-hosted agent in ./plow-credentials, or by line")
-    it.add_argument("line", nargs="?", help="line uid whose self-hosted agent should be retired")
+    it = verbs.add_parser("revoke", help="retire the credential-file agent, or any agent on a line")
+    it.add_argument("line", nargs="?", help="line uid whose agent should be retired (cloud or self-hosted)")
     it.add_argument("--credential-file", default=CREDENTIAL_FILE, help=f"the credential to revoke (default ./{CREDENTIAL_FILE})")
     it.set_defaults(run=revoke)
+
+    it = verbs.add_parser("image", help="build or push this project's image")
+    images = it.add_subparsers(dest="image_verb", required=True)
+    for verb, run in (("build", image_build), ("push", image_push)):
+        image = images.add_parser(verb, help=f"{verb} an image")
+        image.add_argument("image", nargs="?", metavar="IMAGE", help="registry/repository:tag")
+        image.set_defaults(run=run)
+
+    it = verbs.add_parser("deploy", help="request an agent on a line")
+    it.add_argument("target", nargs="?", help="image@sha256:... or exe:<slug>")
+    it.add_argument("--line", help="line uid (default: the only free line)")
+    it.add_argument("--local", action="store_true", help="mint a credential and start this Compose project")
+    it.add_argument("--agent-api-base", default=None, help="with --local, the API root the container reaches (default: --api-base)")
+    it.set_defaults(run=deploy)
+    verbs.add_parser("agents", help="list agent targets and status").set_defaults(run=agents)
 
     args = parser.parse_args()
     # The agent builds `${PLOW_API_BASE}/v1`, so a /v1 here would 404 every call.
@@ -498,7 +691,7 @@ def main() -> int:
     # `--api-base` is where *this tool* calls; the credential says where the
     # *container* calls. The same address usually, but not against a local
     # stack: a 127.0.0.1 that works out here is the container's own loopback.
-    if args.verb == "mint":
+    if args.verb == "mint" or (args.verb == "deploy" and args.local):
         args.agent_api_base = strip_v1(args.agent_api_base) if args.agent_api_base is not None else args.api_base
     args.run(args)
     return 0

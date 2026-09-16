@@ -2,9 +2,10 @@
 services:
   agent:
     build: .
+    env_file:
+      - path: ./plow-credentials
+        required: false
     volumes:
-      # `.host`: the image copies it into place as root, so the file's host ownership does not matter.
-      - ./plow-credentials:/var/lib/plow/credentials.host:ro
       # The agent's home, kept across `up`/`down` for its sessions and setup.
       # `docker compose down -v` starts this agent fresh, and is what an edit
       # to SOUL.md needs before the agent sees it.
