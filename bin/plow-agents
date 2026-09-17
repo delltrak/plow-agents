@@ -201,6 +201,20 @@ def pool_lines(base: str, token: str) -> list[dict]:
     return call("GET", base, "/v1/lines", token=token)["data"]
 
 
+def is_phone_line(line: dict) -> bool:
+    """Whether an agent can be deployed on this line."""
+    return line["provider_type"] == "imessage"
+
+
+def require_phone_line(base: str, token: str, uid: str) -> dict:
+    line = next((row for row in pool_lines(base, token) if row["uid"] == uid), None)
+    if line is None:
+        die(f"unknown line:{uid}")
+    if not is_phone_line(line):
+        die(f"line:{uid} is not a phone line -- `plow-agents lines` lists the ones an agent can answer on")
+    return line
+
+
 def login(args: argparse.Namespace) -> None:
     payload = call("POST", args.api_base, "/v1/auth/activate", body={"name": "plow-agents"})
     code, secret, send_to = (payload.get(k, "") for k in ("display_code", "activation_secret", "send_to"))
@@ -230,7 +244,7 @@ def login(args: argparse.Namespace) -> None:
 
 def lines(args: argparse.Namespace) -> None:
     token = account_token(args)
-    available = pool_lines(args.api_base, token)
+    available = [row for row in pool_lines(args.api_base, token) if is_phone_line(row)]
     print("LINE\tNAME\tNUMBER\tSTATUS")
     for line in sorted(available, key=lambda line: line["uid"]):
         status = line["agent_uid"] or ({True: "free", False: "in use"}.get(line.get("available"), "unknown"))
@@ -352,9 +366,7 @@ def mint(args: argparse.Namespace) -> None:
     # tell which replied, so the line is checked here, before anything is
     # created. There is no flag to proceed anyway: retire the agent that holds
     # it first, which is a decision rather than a keystroke.
-    line = next((row for row in pool_lines(args.api_base, account) if row["uid"] == line_uid), None)
-    if line is None:
-        die(f"unknown line:{line_uid}")
+    line = require_phone_line(args.api_base, account, line_uid)
     if line["agent_uid"]:
         die(f"line:{line_uid} already answers as agent {line['agent_uid']} -- retire it with `plow-agents revoke {line_uid}`")
     if line.get("available") is False:
@@ -588,6 +600,7 @@ def deploy(args: argparse.Namespace) -> None:
             raise
         log("Requested local agent. Run `docker compose logs -f` to watch startup.")
     else:
+        require_phone_line(args.api_base, token, args.line)
         created = call("POST", args.api_base, "/v1/agents", token=token,
                        body={"name": name, "line_uid": args.line, "provider": provider})
         log(f"Requested agent {created['agent']['uid']} on line:{args.line}. Run `plow-agents agents` for status.")
@@ -613,7 +626,7 @@ def main() -> int:
     it = verbs.add_parser("login", help="text a code, store this account's token")
     it.set_defaults(run=login)
 
-    verbs.add_parser("lines", help="the global pool of lines and their availability").set_defaults(run=lines)
+    verbs.add_parser("lines", help="phone lines an agent can be deployed on, with availability").set_defaults(run=lines)
 
     it = verbs.add_parser("profile", help="set or show this account's public profile")
     it.add_argument("--name", help="public display name")

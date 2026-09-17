@@ -25,17 +25,23 @@ from unittest.mock import patch
 CLI = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "plow-agents")
 
 FREE, CLOUD, SELF_HOSTED, OTHER = "ln_free", "ln_cloud", "ln_self_hosted", "ln_other"
+MAILBOX = "ln_mail"
 PHOTO_URL = "https://api.example.com/v1/profile-photos/2b0f9c1e-0000-4000-8000-000000000001"
 
 
 def line(uid: str, name: str) -> dict:
-    return {"uid": uid, "display_name": name, "provider_key": f"+1555{uid[-4:]}"}
+    return {"uid": uid, "display_name": name, "provider_key": f"+1555{uid[-4:]}", "provider_type": "imessage"}
 
 
+# `/v1/lines` serves mailboxes beside phone numbers, and both carry a
+# `provider_type` -- so the stub does too, or the CLI is tested against a shape
+# the API never sends. The mailbox is free and unheld: nothing but its type
+# should keep it out of `lines` and out of `mint`.
 LINES = {"data": [dict(line(uid, name), agent_uid=agent_uid) for uid, name, agent_uid in (
     (FREE, "Free", None), (CLOUD, "Cloud", "agt_cloud"), (SELF_HOSTED, "Self hosted", "agt_self_hosted"),
     (OTHER, "Other account", "agt_other"),
-)]}
+)] + [{"uid": MAILBOX, "display_name": "Free", "provider_key": "free@plow.co",
+       "provider_type": "email", "agent_uid": None}]}
 AGENTS = {
     "agt_other": {"uid": "agt_other", "provider": "self_hosted"},
     "agt_cloud": {"uid": "agt_cloud", "provider": "exe:life"},
@@ -262,6 +268,11 @@ def main() -> int:
         check("self_hosted line names its agent", rows.get(SELF_HOSTED), "agt_self_hosted")
 
         check("another account's held line is in use", rows.get(OTHER), "in use")
+        check("a mailbox is not listed", rows.get(MAILBOX), None)
+        mailbox = run("mint", MAILBOX, cwd=work, base=base, token=token)
+        check("and minting one is refused as not a phone line",
+              mailbox.returncode != 0 and "not a phone line" in mailbox.stderr, True)
+        check("mailbox refusal creates no credential", os.path.exists(os.path.join(work, "plow-credentials")), False)
         other_token = os.path.join(work, "other-token")
         with open(other_token, "w") as handle:
             handle.write("acct_other\n")

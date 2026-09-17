@@ -59,7 +59,13 @@ class Smoke(unittest.TestCase):
         url = req.full_url
         self.assertEqual(req.get_header("Authorization"), "Bearer synthetic-account")
         if url.endswith("/v1/lines"):
-            return Response({"data": [{"uid": "ln_free", "agent_uid": None}]})
+            # `provider_type` on every row, because the API sends it on every
+            # row and both `mint` and a remote `deploy` now read it.
+            return Response({"data": [
+                {"uid": "ln_free", "agent_uid": None, "provider_type": "imessage"},
+                {"uid": "ln_explicit", "agent_uid": None, "provider_type": "imessage"},
+                {"uid": "ln_mail", "agent_uid": None, "provider_type": "email"},
+            ]})
         if req.method == "POST":
             self.created.append(json.loads(req.data))
             return Response({"agent": {"uid": "agt_test"}, "token": "synthetic-agent"})
@@ -208,6 +214,15 @@ class Smoke(unittest.TestCase):
                 "name": name, "line_uid": "ln_explicit",
                 "provider": target if target.startswith("exe:") else f"exe:{IMAGE}@{DIGEST}",
             })
+        # A remote deploy validates the line before it creates anything: an
+        # unknown uid and a mailbox are both refused by name, with no POST.
+        self.created.clear()
+        for line_uid, said in (
+            ("ln_nope", "unknown line:ln_nope"),
+            ("ln_mail", "line:ln_mail is not a phone line -- `plow-agents lines` lists the ones an agent can answer on"),
+        ):
+            self.run_cli("deploy", "exe:hermes", "--line", line_uid, success=False, expected_error=f"plow-agents: {said}")
+        self.assertFalse(self.created)
         self.created.clear()
         self.requests.clear()
         Path("plow-agents.toml").write_text(f'image = "{IMAGE}:v1"\nlast_pushed = "{IMAGE}@{DIGEST}"\n')
