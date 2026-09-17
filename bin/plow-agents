@@ -2,9 +2,7 @@
 """Manage the Plow agents on your account. Standard library only.
 
     plow-agents login            one-time: text a code, get an account token
-    plow-agents login --new-line same, and be given an assistant line
-    plow-agents lines            the assistant lines this account holds, and who
-                                 is already answering on each
+    plow-agents lines            the global pool of lines and their availability
     plow-agents mint <line-uid>  that line's credential -> ./plow-credentials
     plow-agents profile          set or show this account's public profile (--photo takes a file)
     plow-agents rotate           replace this self-hosted agent's credential
@@ -198,27 +196,13 @@ def account_token(args: argparse.Namespace) -> str:
 # --- verbs -----------------------------------------------------------------
 
 
-def account_lines(base: str, token: str) -> list[dict]:
-    """Only lines on which this account owns an active chat can be minted."""
-    chats = call("GET", base, "/v1/chats", token=token)["data"]
-    owned = {
-        participant["line"]["uid"]
-        for chat in chats if chat["status"] == "active"
-        for participant in chat["participants"]
-        if participant["type"] == "agent" and participant["relationship"] == "self"
-    }
-    if not owned:
-        return []
-    return [line for line in call("GET", base, "/v1/lines", token=token)["data"] if line["uid"] in owned]
+def pool_lines(base: str, token: str) -> list[dict]:
+    """Read pool lines and their assistant occupancy from Plow."""
+    return call("GET", base, "/v1/lines", token=token)["data"]
 
 
 def login(args: argparse.Namespace) -> None:
-    # `provision_chat` asks for a line and a chat on it in the same handshake:
-    # a real change to the account, and one nothing here can undo. So it is
-    # asked for only when you say so. Nothing on this machine can decide it
-    # either -- a cached token is evidence about whoever logged in last, which
-    # need not be the account about to text the code below.
-    payload = call("POST", args.api_base, "/v1/auth/activate", body={"name": "plow-agents", "provision_chat": args.new_line})
+    payload = call("POST", args.api_base, "/v1/auth/activate", body={"name": "plow-agents"})
     code, secret, send_to = (payload.get(k, "") for k in ("display_code", "activation_secret", "send_to"))
     if not (code and secret and send_to):
         die("activation returned no code, secret or number")
@@ -239,11 +223,6 @@ def login(args: argparse.Namespace) -> None:
                 die("activation verified but returned no token")
             written = write_private(token_path(args.token_file), token + "\n")
             log(f"Wrote {written} (mode 600). This is your ACCOUNT token -- it stays here.")
-            # Now that a token is in hand, this account can be asked about
-            # itself -- and `mint` has nothing to scope a credential to
-            # without a line, so say so here rather than two verbs later.
-            if not account_lines(args.api_base, token):
-                log("This account holds no assistant line yet: run `plow-agents login --new-line` to be given one.")
             return
         time.sleep(POLL_S)
     die(f"timed out after {TIMEOUT_S}s waiting for the text")
@@ -251,14 +230,10 @@ def login(args: argparse.Namespace) -> None:
 
 def lines(args: argparse.Namespace) -> None:
     token = account_token(args)
-    available = account_lines(args.api_base, token)
-    if not available:
-        log("No assistant lines on this account yet.")
-        log("Run `plow-agents login --new-line` to be given one.")
-        return
+    available = pool_lines(args.api_base, token)
     print("LINE\tNAME\tNUMBER\tSTATUS")
     for line in sorted(available, key=lambda line: line["uid"]):
-        status = line["agent_uid"] or "free"
+        status = line["agent_uid"] or ({True: "free", False: "in use"}.get(line.get("available"), "unknown"))
         print(f"{line['uid']}\t{line.get('display_name') or ''}\t{line.get('provider_key') or ''}\t{status}")
 
 
@@ -377,11 +352,13 @@ def mint(args: argparse.Namespace) -> None:
     # tell which replied, so the line is checked here, before anything is
     # created. There is no flag to proceed anyway: retire the agent that holds
     # it first, which is a decision rather than a keystroke.
-    line = next((row for row in call("GET", args.api_base, "/v1/lines", token=account)["data"] if row["uid"] == line_uid), None)
+    line = next((row for row in pool_lines(args.api_base, account) if row["uid"] == line_uid), None)
     if line is None:
         die(f"unknown line:{line_uid}")
     if line["agent_uid"]:
         die(f"line:{line_uid} already answers as agent {line['agent_uid']} -- retire it with `plow-agents revoke {line_uid}`")
+    if line.get("available") is False:
+        die(f"line:{line_uid} is in use by another account -- choose a free line")
     minted = call("POST", args.api_base, "/v1/agents", token=account,
                   body={"name": "plow-agent", "provider": "self_hosted", "line_uid": line_uid})
     agent, token = minted["agent"], minted["token"]
@@ -417,7 +394,7 @@ def revoke(args: argparse.Namespace) -> None:
     credential = read_credential(path)
     account = account_token(args)
     if args.line:
-        available = call("GET", args.api_base, "/v1/lines", token=account)["data"]
+        available = pool_lines(args.api_base, account)
         line = next((line for line in available if line["uid"] == args.line), None)
         if line is None:
             die(f"unknown line:{args.line}")
@@ -599,11 +576,6 @@ def deploy(args: argparse.Namespace) -> None:
             provider = f"exe:{repository}@{digest}"
             name = image_repository(repository).rsplit("/", 1)[-1]
     token = account_token(args)
-    if not args.line:
-        free = [row["uid"] for row in account_lines(args.api_base, token) if not row["agent_uid"]]
-        if len(free) != 1:
-            die("pass --line with a free line from `plow-agents lines` (or login --new-line to get one)")
-        args.line = free[0]
     if args.local:
         args.credential_file = CREDENTIAL_FILE
         mint(args)
@@ -639,10 +611,9 @@ def main() -> int:
     verbs = parser.add_subparsers(dest="verb", required=True)
 
     it = verbs.add_parser("login", help="text a code, store this account's token")
-    it.add_argument("--new-line", action="store_true", help="also have Plow give this account a new assistant line and a chat on it")
     it.set_defaults(run=login)
 
-    verbs.add_parser("lines", help="the assistant lines this account holds").set_defaults(run=lines)
+    verbs.add_parser("lines", help="the global pool of lines and their availability").set_defaults(run=lines)
 
     it = verbs.add_parser("profile", help="set or show this account's public profile")
     it.add_argument("--name", help="public display name")
@@ -674,7 +645,7 @@ def main() -> int:
 
     it = verbs.add_parser("deploy", help="request an agent on a line")
     it.add_argument("target", nargs="?", help="image@sha256:... or exe:<slug>")
-    it.add_argument("--line", help="line uid (default: the only free line)")
+    it.add_argument("--line", required=True, help="line uid, as printed by `lines`")
     it.add_argument("--local", action="store_true", help="mint a credential and start this Compose project")
     it.add_argument("--agent-api-base", default=None, help="with --local, the API root the container reaches (default: --api-base)")
     it.set_defaults(run=deploy)

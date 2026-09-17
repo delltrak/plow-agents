@@ -16,12 +16,15 @@ send it as a bearer. See the [image contract](https://github.com/plow-pbc/plow/b
 ```sh
 git clone https://github.com/plow-pbc/plow-agents.git
 export PATH="$PWD/plow-agents/bin:$PATH"
-plow-agents login --new-line
+plow-agents login
 plow-agents lines
 ```
 
-Text the activation phrase to the number printed by `login`. Use `plow-agents login`
-if you already have a line. Keep the ID of a `free` line for step 5.
+Text the activation phrase to the number printed by `login`. The `lines` command
+shows the global pool: any account may claim an unheld line. Keep the ID of a
+`free` line for step 5. A line held by another account is `in use`; your own
+agent is shown by its uid. An older API that does not report availability shows
+`unknown` instead of claiming that a line is free.
 
 ## 2. Write a Dockerfile
 
@@ -70,8 +73,7 @@ plow-agents deploy ghcr.io/YOUR_ACCOUNT/my-agent@sha256:… --line ln_xxx
 plow-agents agents
 ```
 
-You can also deploy a listing with `plow-agents deploy exe:hermes`.
-If your account has exactly one free line, `deploy` selects it.
+You can also deploy a listing with `plow-agents deploy exe:hermes --line ln_xxx`.
 
 ## 6. Text it
 
@@ -125,16 +127,16 @@ plow-agents profile --show
 
 | Command | Purpose |
 | --- | --- |
-| `plow-agents login [--new-line]` | Log in by text; optionally create a line. |
-| `plow-agents lines` | Show line IDs, numbers, and occupancy. |
+| `plow-agents login` | Log in by text. |
+| `plow-agents lines` | Show the global pool of line IDs, numbers, and availability. |
 | `plow-agents profile [--name NAME] [--photo PHOTO] [--show]` | Set or show your profile; a photo can be a file or HTTPS URL. |
 | `plow-agents mint LINE [--credential-file PATH] [--agent-api-base URL]` | Write a credential for a self-hosted agent. |
 | `plow-agents rotate [--credential-file PATH]` | Replace the credential; recreate the container to load it. |
 | `plow-agents revoke [LINE] [--credential-file PATH]` | Retire any agent on LINE, or the credential-file self-hosted agent. |
 | `plow-agents image build [IMAGE]` | Build the current directory for linux/amd64. |
 | `plow-agents image push [IMAGE]` | Push and print the full image reference. |
-| `plow-agents deploy TARGET [--line LINE]` | Request an image@sha256:… or an `exe:slug` listing. |
-| `plow-agents deploy --local [--line LINE] [--agent-api-base URL]` | Mint a credential and start Compose locally. |
+| `plow-agents deploy TARGET --line LINE` | Request an image@sha256:… or an `exe:slug` listing. |
+| `plow-agents deploy --local --line LINE [--agent-api-base URL]` | Mint a credential and start Compose locally. |
 | `plow-agents agents` | Show tab-separated line, target, and status. |
 
 Every command accepts `--help`. Global `--api-base URL` and `--token-file PATH`
