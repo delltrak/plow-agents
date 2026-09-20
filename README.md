@@ -20,7 +20,13 @@ plow-agents login
 plow-agents lines
 ```
 
-Text the activation phrase to the number printed by `login`. The `lines` command
+On an interactive macOS terminal, `login` offers to open Messages and prepare a
+new message with the recipient and activation phrase already filled in, using
+macOS's `sms:` URL support. This draft-body behavior is verified on macOS but is
+not part of Apple's documented `sms:` contract, so the printed number and phrase
+remain the manual fallback. Review the message and press Send; it is never sent
+automatically. Use `plow-agents login --no-messages` to keep the manual flow. On
+other platforms, text the activation phrase to the number printed by `login`. The `lines` command
 shows the phone lines an agent can be deployed on: any account may claim an unheld line. Keep the ID of a
 `free` line for step 5. A line held by another account is `in use`; your own
 agent is shown by its uid. An older API that does not report availability shows

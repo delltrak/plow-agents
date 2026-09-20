@@ -193,6 +193,50 @@ def account_token(args: argparse.Namespace) -> str:
     return token
 
 
+def offer_imessage_activation(code: str, send_to: str) -> None:
+    """Offer to prepare the activation text in Messages on an interactive Mac.
+
+    Messages accepts the recipient and draft body in an sms URL. Opening that
+    URL prepares the draft but never sends it.
+    """
+    if sys.platform != "darwin" or not sys.stdin.isatty() or not sys.stdout.isatty():
+        return
+
+    try:
+        answer = input("  Press Enter to open Messages and prepare the text (or type n to skip): ")
+    except EOFError:
+        return
+    if answer.strip().lower() not in ("", "y", "yes"):
+        return
+
+    body = f"Plow Activate: {code}"
+    sms_number = urllib.parse.quote(send_to, safe="+.-")
+    sms_body = urllib.parse.quote(body, safe="")
+    sms_url = f"sms:{sms_number}?&body={sms_body}"
+    try:
+        opened = subprocess.run(
+            ["open", sms_url],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        log("Messages did not open within 5 seconds; no message was sent.")
+        return
+    except OSError as error:
+        log(f"Could not open Messages: {error}")
+        return
+    if opened.returncode != 0:
+        detail = opened.stderr.strip()
+        log("Could not open the Messages conversation; no message was sent.")
+        if detail:
+            log(f"  {detail}")
+        return
+
+    log("Asked macOS to open Messages with the recipient and activation text. Review it and press Send.")
+
+
 # --- verbs -----------------------------------------------------------------
 
 
@@ -223,6 +267,8 @@ def login(args: argparse.Namespace) -> None:
     log("")
     log(f"  Text  Plow Activate: {code}  to  {send_to}")
     log("")
+    if not args.no_messages:
+        offer_imessage_activation(code, send_to)
     log("Waiting for that text ...")
     deadline = time.monotonic() + TIMEOUT_S
     while time.monotonic() < deadline:
@@ -624,6 +670,7 @@ def main() -> int:
     verbs = parser.add_subparsers(dest="verb", required=True)
 
     it = verbs.add_parser("login", help="text a code, store this account's token")
+    it.add_argument("--no-messages", action="store_true", help="do not offer to prepare activation in Messages on macOS")
     it.set_defaults(run=login)
 
     verbs.add_parser("lines", help="phone lines an agent can be deployed on, with availability").set_defaults(run=lines)
